@@ -1,4 +1,9 @@
-# Data layer uses only the stdlib + pandas (already present system-wide).
-# These are needed for later steps (optimizer / optional scraping):
-pandas
-pulp
+# Core runtime for the matchday pipeline (run_all.py):
+pandas        # data layer, everywhere
+numpy         # advancement / projection / odds_blend / predict_scores
+pulp          # squad optimizer (optimize.py)
+Unidecode     # name normalisation for player matching (match_players.py)
+
+# Club-stats scrape (club_stats.py): runs on --refresh-club, and on the
+# first run when data/processed/club_player_stats.csv is not yet cached.
+soccerdata    # FBref season stats (pulls in lxml/requests as deps)

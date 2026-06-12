@@ -94,6 +94,13 @@ def fixture_probs(la: float, lb: float, kmax: int = 12) -> dict[str, float]:
 
 
 # --- (a) per-fixture probabilities -----------------------------------------
+def played_result(m) -> tuple[int, int] | None:
+    """Actual (home_goals, away_goals) if this fixture has been played, else None."""
+    if pd.notna(m.get("home_score")) and pd.notna(m.get("away_score")):
+        return int(m["home_score"]), int(m["away_score"])
+    return None
+
+
 def build_fixture_probs(fixtures: pd.DataFrame, elo: dict[str, float]) -> pd.DataFrame:
     rows = []
     for _, m in fixtures.iterrows():
@@ -101,11 +108,24 @@ def build_fixture_probs(fixtures: pd.DataFrame, elo: dict[str, float]) -> pd.Dat
         if pd.isna(h) or pd.isna(a) or h not in elo or a not in elo:
             continue  # knockout rows have no teams yet
         la, lb = expected_goals(elo[h], elo[a], h in HOSTS, a in HOSTS)
+        actual = played_result(m)
+        if actual is not None:
+            # match already played -> collapse to the realised outcome
+            gh, ga = actual
+            probs = {
+                "exp_goals_home": float(gh), "exp_goals_away": float(ga),
+                "p_home_win": float(gh > ga), "p_draw": float(gh == ga),
+                "p_away_win": float(gh < ga),
+                "p_cs_home": float(ga == 0), "p_cs_away": float(gh == 0),
+            }
+        else:
+            probs = fixture_probs(la, lb)
         rows.append({
             "match_id": m["match_id"], "round_id": m["round_id"],
             "round_label": m["round_label"], "date": m["date"],
             "home_country": h, "away_country": a,
-            **fixture_probs(la, lb),
+            "played": actual is not None,
+            **probs,
         })
     return pd.DataFrame(rows)
 
@@ -139,20 +159,25 @@ def simulate(fixtures: pd.DataFrame, teams: pd.DataFrame,
     for c in countries:
         groups.setdefault(teams.set_index("country").loc[c, "group"], []).append(idx[c])
 
-    # Pre-compute each real group match as (home_idx, away_idx, lambda_home, lambda_away).
+    # Pre-compute each real group match. `actual` pins already-played matches to
+    # their real scoreline so advancement is conditioned on the standings so far;
+    # only the remaining fixtures are randomised.
     gmatches = []
     for _, m in fixtures[fixtures["round_id"] <= 3].iterrows():
         h, a = m["home_country"], m["away_country"]
         la, lb = expected_goals(elo[h], elo[a], h in HOSTS, a in HOSTS)
-        gmatches.append((idx[h], idx[a], la, lb))
+        gmatches.append((idx[h], idx[a], la, lb, played_result(m)))
 
     first = np.zeros(n); second = np.zeros(n); third = np.zeros(n); adv = np.zeros(n)
     ko = {r: np.zeros(n) for r in KO_ROUNDS}
 
     for _ in range(n_sims):
         pts = np.zeros(n); gf = np.zeros(n); ga = np.zeros(n)
-        for hi, ai, la, lb in gmatches:
-            gh, gA = rng.poisson(la), rng.poisson(lb)
+        for hi, ai, la, lb, actual in gmatches:
+            if actual is not None:
+                gh, gA = actual                 # played match: use the real score
+            else:
+                gh, gA = rng.poisson(la), rng.poisson(lb)
             gf[hi] += gh; ga[hi] += gA; gf[ai] += gA; ga[ai] += gh
             if gh > gA:
                 pts[hi] += 3
@@ -207,8 +232,16 @@ def simulate(fixtures: pd.DataFrame, teams: pd.DataFrame,
 
 # --- main ------------------------------------------------------------------
 def main(n_sims: int = 20_000) -> None:
+    from form_update import updated_elo
+
     teams = pd.read_csv(PROCESSED / "team_strength.csv")
-    fixtures = pd.read_csv(PROCESSED / "fixtures.csv")
+    fixtures = pd.read_csv(PROCESSED / "fixtures.csv", parse_dates=["date"])
+
+    # Fold actual results into the ratings so REMAINING matches are simulated at
+    # updated strength (played matches are pinned to their real score below).
+    live = updated_elo(dict(zip(teams["country"], teams["elo"])),
+                       fixtures[fixtures["round_id"] <= 3])
+    teams["elo"] = teams["country"].map(live)
     elo = dict(zip(teams["country"], teams["elo"]))
 
     print("Building per-fixture probabilities...")

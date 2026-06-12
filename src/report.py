@@ -89,19 +89,40 @@ def squads_section(squads):
 
 def predictions_section():
     preds = pd.read_csv(PROCESSED / "group_score_predictions.csv")
-    md = ["## 📊 Group-Stage Score Predictions\n"]
-    for rnd in ["Group MD1", "Group MD2", "Group MD3"]:
-        sub = preds[preds["round_label"] == rnd].sort_values(["group", "home"])
+    md = ["## 📊 Group-Stage Score Predictions\n",
+          "_Each matchday's prediction is **frozen at its first kickoff** "
+          "(🔒) and graded against the actual result. Not-yet-started matchdays "
+          "stay live and are refreshed from results so far._\n",
+          "_**Mean goals (λ)** are each side's expected goals; **Prediction** "
+          "rounds them; **Most likely** is the single most common exact scoreline "
+          "in the simulation (the mode). They differ because goals are "
+          "Poisson-distributed and right-skewed — the long tail of high-scoring "
+          "games pulls the mean above the modal (most probable) score._\n"]
+    for mday, rnd in [(1, "Group MD1"), (2, "Group MD2"), (3, "Group MD3")]:
+        sub = preds[preds["matchday"] == mday].sort_values(["group", "home"])
         if sub.empty:
             continue
-        md.append(f"### {rnd}\n")
-        md.append("| Grp | Match | Avg score | Most likely | W / D / L |")
-        md.append("|:---:|:---|:---:|:---:|:---:|")
+        frozen = bool(sub["locked"].iloc[0])
+        graded = sub[sub["actual_home"].notna()]
+        head = f"### {rnd}" + (" 🔒" if frozen else " · live")
+        if len(graded):
+            head += (f"  —  {int(graded['exact_hit'].sum())}/{len(graded)} exact, "
+                     f"{int(graded['result_hit'].sum())}/{len(graded)} result")
+        md.append(head + "\n")
+        md.append("| Grp | Match | Mean goals (λ) | Prediction (round λ) "
+                  "| Most likely (mode) | Actual |")
+        md.append("|:---:|:---|:---:|:---:|:---:|:---:|")
         for _, r in sub.iterrows():
+            if pd.notna(r.actual_home):
+                mark = "✅" if r.exact_hit else "🟨" if r.result_hit else "❌"
+                actual = f"**{int(r.actual_home)}–{int(r.actual_away)}** {mark}"
+            else:
+                actual = "—"
             md.append(f"| {r.group} | {r.home} vs {r.away} "
-                      f"| {r.exp_home:.1f}–{r.exp_away:.1f} "
-                      f"| **{r.mode_home}–{r.mode_away}** ({r.mode_prob:.0%}) "
-                      f"| {r.p_home_win:.0%} / {r.p_draw:.0%} / {r.p_away_win:.0%} |")
+                      f"| {r.exp_home:.2f}–{r.exp_away:.2f} "
+                      f"| {r.pred_home}–{r.pred_away} "
+                      f"| {r.mode_home}–{r.mode_away} ({r.mode_prob:.0%}) "
+                      f"| {actual} |")
         md.append("")
     return "\n".join(md)
 

@@ -4,7 +4,9 @@ Run this after each matchday to regenerate the optimised squads and score
 predictions against the latest FIFA feed (prices, availability, eliminations).
 
 Stages:
-  1. FIFA feeds (players/fixtures)      - re-fetched every run (cheap)
+  1. FIFA feeds + live stats            - re-fetched every run (cheap): prices,
+                                          availability, played scores, and per-
+                                          player goals/assists/fantasy form
   2. Elo -> team strength               - cached unless --refresh-elo
   3. advancement sim + odds blend       - re-run every time
   4. club stats (FBref scrape)          - SKIPPED by default: the 2025-26 club
@@ -33,6 +35,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import advancement
 import fifa_data
+import form_update
+import live_stats
 import match_players
 import odds_blend
 import projection
@@ -55,11 +59,14 @@ def main():
                     help="reuse cached FIFA feed (fully reproducible run)")
     args = ap.parse_args()
 
-    step("1/7  FIFA feeds (prices, availability, eliminations)")
+    step("1/7  FIFA feeds (prices, availability, eliminations, live scores)")
     fifa_data.main(force=not args.no_refresh)
+    # actual goals/assists + fantasy form for matches played so far
+    live_stats.main()
 
-    step("2/7  Elo -> team strength")
+    step("2/7  Elo -> team strength (+ live form update from results)")
     team_strength.main(force=args.refresh_elo)
+    form_update.main()   # nudge Elo by actual results -> team_strength_live.csv
 
     step(f"3/7  Advancement simulation ({args.sims:,} sims) + odds blend")
     advancement.main(n_sims=args.sims)

@@ -20,12 +20,15 @@ Inputs : players_with_stats.csv, fixture_probs.csv, team_advancement_blended.csv
 Output : data/processed/players_with_xp.csv  (+ a printed sanity check)
 """
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
 PLAYERS = "data/processed/players_with_stats.csv"
 FIXTURES = "data/processed/fixture_probs.csv"
 TEAMS = "data/processed/team_advancement_blended.csv"
+LIVE = "data/processed/player_live_stats.csv"   # actual WC returns (may not exist pre-KO)
 OUT = "data/processed/players_with_xp.csv"
 
 # --- scoring table (user-confirmed Table A) --------------------------------
@@ -60,6 +63,14 @@ BASELINE_TG = 1.35        # league-average team goals/match; the opp-adjust pivo
 KO_DAMP = 0.88            # KO opponents are tougher than a team's group average
 SOT_OPP_SENSITIVITY = 0.5 # how much SoT (vs goals) reacts to opponent strength
 
+# --- live (actual WC) blending --------------------------------------------
+# How much one already-played World Cup match counts, in club-90 units, when we
+# fold a player's real WC goals/assists into their projected rates. >1 because
+# WC games are recent, top-opposition, and national-team evidence; keep modest
+# so a single hot/quiet game doesn't dominate a full club season. Tune freely.
+LIVE_WEIGHT = 2.0
+LIVE_MIN_SEC = 0.80       # a player who has already featured is confirmed to play
+
 
 def minutes_security(minutes):
     """0..1: ~1 for an ever-present, scaling down with fewer minutes/game."""
@@ -86,12 +97,34 @@ def per_match_xp(pos, g90, a90, sot90, sec, team_xg, p_cs):
 
 
 def team_fixtures(fx):
-    """country -> list of (team_xg, p_cs) for its 3 group matches + season means."""
+    """country -> list of (team_xg, p_cs) for its *remaining* group matches.
+
+    Already-played fixtures are dropped: their points are banked, not future xP,
+    so the squad you pick now should be scored only on the games still to come.
+    """
+    if "played" in fx.columns:
+        fx = fx[~fx["played"].astype(bool)]
     rows = {}
     for _, m in fx.iterrows():
         rows.setdefault(m.home_country, []).append((m.exp_goals_home, m.p_cs_home))
         rows.setdefault(m.away_country, []).append((m.exp_goals_away, m.p_cs_away))
     return rows
+
+
+def blend_live(df):
+    """Fold actual WC goals/assists into the per-90 rates and confirm minutes for
+    players who have already featured. The established (club) rate carries `eff`
+    90s of weight; each WC game adds LIVE_WEIGHT 90s at the observed WC rate. WC
+    opposition is ~EPL difficulty, so the WC tallies need no league rescale."""
+    df = df.copy()
+    games = df["wc_games"].fillna(0)
+    eff = df["nineties"].fillna(0).clip(lower=SHRINK_90S)
+    for col, rate in [("goals", "g90"), ("assists", "a90")]:
+        wc = df[f"wc_{col}"].fillna(0)
+        df[rate] = (df[rate] * eff + LIVE_WEIGHT * wc) / (eff + LIVE_WEIGHT * games)
+    confirmed = games > 0
+    df.loc[confirmed, "sec"] = np.maximum(df.loc[confirmed, "sec"], LIVE_MIN_SEC)
+    return df
 
 
 def build_rates(df):
@@ -154,10 +187,21 @@ def main():
     teams = pd.read_csv(TEAMS)[["country", "exp_games"]]
     df = df.merge(teams, on="country", how="left")
 
+    # actual WC returns so far (file is absent until the tournament starts)
+    live_cols = ["wc_games", "wc_goals", "wc_assists", "wc_points", "form"]
+    if Path(LIVE).exists():
+        live = pd.read_csv(LIVE)
+        df = df.merge(live, on="player_id", how="left")
+    for c in live_cols:
+        if c not in df.columns:
+            df[c] = 0
+        df[c] = df[c].fillna(0)
+
     df = build_rates(df)
     df = apply_league_strength(df)   # rates -> EPL-equivalent before imputing
     df["sec"] = minutes_security(df["minutes"].fillna(0))
     df = impute_unmatched(df)   # fills sec/rates for unmatched, sets `imputed`
+    df = blend_live(df)         # fold in actual WC goals/assists + confirmed minutes
 
     tf = team_fixtures(fx)
 
@@ -182,7 +226,8 @@ def main():
     df["value"] = df["xp"] / df["price"]
     out = df[["player_id", "display_name", "position", "country", "price",
               "percent_selected", "exp_games", "sec", "league", "lg_coef",
-              "g90", "a90", "sot90", "xp", "value", "imputed"]].sort_values("xp", ascending=False)
+              "g90", "a90", "sot90", "wc_games", "wc_goals", "wc_assists",
+              "xp", "value", "imputed"]].sort_values("xp", ascending=False)
     out.to_csv(OUT, index=False)
 
     print(f"{len(out)} players projected -> {OUT}")

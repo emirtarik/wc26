@@ -23,16 +23,25 @@ Usage:
 from __future__ import annotations
 
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from advancement import HOSTS, expected_goals
+from form_update import updated_elo
 
 ROOT = Path(__file__).resolve().parents[1]
 PROCESSED = ROOT / "data" / "processed"
 OUT = PROCESSED / "group_score_predictions.csv"
+LOCK = PROCESSED / "score_predictions_locked.csv"   # frozen per-matchday snapshots
+
+# Columns that make up a projection (everything except actual-result / status).
+PROJ_COLS = ["match_id", "round_label", "matchday", "date", "group", "home", "away",
+             "pred_home", "pred_away", "exp_home", "exp_away",
+             "mode_home", "mode_away", "mode_prob",
+             "p_home_win", "p_draw", "p_away_win", "top3"]
 
 
 def simulate_match(la: float, lb: float, n: int, rng) -> dict:
@@ -59,47 +68,100 @@ def simulate_match(la: float, lb: float, n: int, rng) -> dict:
     }
 
 
-def main(n_sims: int = 50_000) -> None:
-    teams = pd.read_csv(PROCESSED / "team_strength.csv")
-    fixtures = pd.read_csv(PROCESSED / "fixtures.csv")
-    elo = dict(zip(teams["country"], teams["elo"]))
-    grp = dict(zip(teams["country"], teams["group"]))
-
-    rng = np.random.default_rng(42)
-    group_fx = fixtures[fixtures["round_id"] <= 3]
-
+def project_fixtures(group_fx, grp, elo_by_md, n_sims, rng):
+    """Fresh per-match projection. Matchday N uses the as-of-MD-N rating
+    (elo_by_md[N] = base Elo updated with results from earlier matchdays only),
+    so already-played matches keep the projection we *would have* made, never the
+    actual score."""
     rows = []
     for _, m in group_fx.iterrows():
         h, a = m["home_country"], m["away_country"]
+        md = int(m["round_id"])
+        elo = elo_by_md[md]
         if pd.isna(h) or pd.isna(a) or h not in elo or a not in elo:
             continue
         la, lb = expected_goals(elo[h], elo[a], h in HOSTS, a in HOSTS)
         sim = simulate_match(la, lb, n_sims, rng)
         rows.append({
             "match_id": m["match_id"], "round_label": m["round_label"],
-            "date": m["date"], "group": grp.get(h, "?"),
+            "matchday": md, "date": m["date"], "group": grp.get(h, "?"),
             "home": h, "away": a,
             "pred_home": int(round(sim["exp_home"])),
             "pred_away": int(round(sim["exp_away"])),
             **sim,
         })
+    return pd.DataFrame(rows)[PROJ_COLS]
 
-    out = pd.DataFrame(rows)
+
+def main(n_sims: int = 50_000) -> None:
+    teams = pd.read_csv(PROCESSED / "team_strength.csv")
+    fixtures = pd.read_csv(PROCESSED / "fixtures.csv", parse_dates=["date"])
+    base = dict(zip(teams["country"], teams["elo"]))
+    grp = dict(zip(teams["country"], teams["group"]))
+    group_fx = fixtures[fixtures["round_id"] <= 3]
+    results = group_fx
+
+    # Rating to project each matchday with: results from *earlier* matchdays only.
+    elo_by_md = {md: updated_elo(base, results, max_round=md - 1) for md in (1, 2, 3)}
+
+    rng = np.random.default_rng(42)
+    proj = project_fixtures(group_fx, grp, elo_by_md, n_sims, rng)
+
+    # --- freeze each matchday at its first kickoff -------------------------
+    now = datetime.now(timezone.utc)
+    md_start = group_fx.groupby("round_id")["date"].min()
+    started = {md: now >= md_start[md] for md in (1, 2, 3)}
+
+    lock = pd.read_csv(LOCK) if LOCK.exists() else pd.DataFrame(columns=PROJ_COLS + ["locked_at"])
+    locked_ids = set(lock["match_id"]) if len(lock) else set()
+    fresh_to_lock = proj[proj["matchday"].map(started) & ~proj["match_id"].isin(locked_ids)].copy()
+    if len(fresh_to_lock):
+        fresh_to_lock["locked_at"] = now.isoformat()
+        lock = pd.concat([lock, fresh_to_lock], ignore_index=True)
+        lock.to_csv(LOCK, index=False)
+        locked_ids = set(lock["match_id"])
+        print(f"  froze {len(fresh_to_lock)} projections for matchdays "
+              f"{sorted(set(fresh_to_lock['matchday']))} -> {LOCK.name}")
+
+    # Final projection = frozen snapshot where a matchday has started, fresh else.
+    locked_rows = lock[lock["match_id"].isin(proj["match_id"])][PROJ_COLS]
+    out = pd.concat([locked_rows,
+                     proj[~proj["match_id"].isin(locked_ids)]], ignore_index=True)
+    out["locked"] = out["match_id"].isin(locked_ids)
+
+    # --- attach actual results for projection-vs-reality comparison --------
+    res = group_fx[["match_id", "home_score", "away_score"]].rename(
+        columns={"home_score": "actual_home", "away_score": "actual_away"})
+    out = out.merge(res, on="match_id", how="left")
+    played = out["actual_home"].notna()
+    out["exact_hit"] = played & (out["pred_home"] == out["actual_home"]) \
+                              & (out["pred_away"] == out["actual_away"])
+    out["result_hit"] = played & (np.sign(out["pred_home"] - out["pred_away"])
+                                  == np.sign(out["actual_home"] - out["actual_away"]))
+    out = out.sort_values(["matchday", "group", "home"]).reset_index(drop=True)
     out.to_csv(OUT, index=False)
 
     # --- printed table, grouped by matchday ---
-    print(f"Group-stage score predictions ({n_sims:,} sims/match)\n")
-    for rnd in ["Group MD1", "Group MD2", "Group MD3"]:
-        sub = out[out["round_label"] == rnd].sort_values(["group", "home"])
+    print(f"\nGroup-stage score predictions ({n_sims:,} sims/match)\n")
+    for md, rnd in [(1, "Group MD1"), (2, "Group MD2"), (3, "Group MD3")]:
+        sub = out[out["matchday"] == md]
         if sub.empty:
             continue
-        print(f"=== {rnd} ===")
+        tag = "FROZEN" if started[md] else "live"
+        print(f"=== {rnd} [{tag}] ===")
         for _, r in sub.iterrows():
-            line = (f"  [{r.group}] {r.home[:14]:14} {r.exp_home:.1f}-{r.exp_away:.1f} "
-                    f"{r.away[:14]:14}  | most likely {r.mode_home}-{r.mode_away} "
-                    f"({r.mode_prob:.0%})  | W/D/L {r.p_home_win:.0%}/{r.p_draw:.0%}/{r.p_away_win:.0%}")
+            line = (f"  [{r.group}] {r.home[:14]:14} {r.pred_home}-{r.pred_away} "
+                    f"{r.away[:14]:14}  (most likely {r.mode_home}-{r.mode_away} "
+                    f"{r.mode_prob:.0%})")
+            if pd.notna(r.actual_home):
+                mark = "✓ exact" if r.exact_hit else "✓ result" if r.result_hit else "✗ miss"
+                line += f"  | ACTUAL {int(r.actual_home)}-{int(r.actual_away)} {mark}"
             print(line)
         print()
+    graded = out[out["actual_home"].notna()]
+    if len(graded):
+        print(f"Accuracy so far: {graded['exact_hit'].sum()}/{len(graded)} exact, "
+              f"{graded['result_hit'].sum()}/{len(graded)} correct result")
     print(f"-> {OUT}")
 
 
